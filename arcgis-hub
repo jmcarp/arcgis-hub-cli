@@ -1,0 +1,228 @@
+#!/usr/bin/env python
+
+import argparse
+import datetime
+import itertools
+import pathlib
+import shutil
+import sys
+import time
+from typing import Optional, Sequence
+
+import requests
+import tabulate
+import werkzeug.http
+
+BASE_URL = "https://opendata.arcgis.com/api/v3"
+
+
+def print_additional_records(meta, limit):
+    total = meta["stats"]["totalCount"]
+    if args.limit and total > limit:
+        print(
+            f"{total - limit} more results available; set `--limit` for more",
+            file=sys.stderr,
+        )
+
+
+def iter_results(response):
+    data = response.json()
+    for result in data["data"]:
+        yield result
+    if data["meta"].get("next") is not None:
+        response = requests.get(data["meta"]["next"])
+        response.raise_for_status()
+        yield from iter_results(response)
+
+
+def list_datasets(
+    group_ids: Optional[Sequence[str]] = None,
+    tags: Optional[Sequence[str]] = None,
+    query: str = "*",
+):
+    filter_ = {
+        "openData": True,
+        "collection": "any(Dataset)",
+    }
+    if tags:
+        filter_["tags"] = f"any({','.join(tags)})"
+    catalog = {}
+    if group_ids:
+        catalog["groupIds"] = f"any({','.join(group_ids)})"
+    response = requests.post(
+        f"{BASE_URL}/search",
+        json={
+            "q": query,
+            "filter": filter_,
+            "catalog": catalog,
+        },
+    )
+    response.raise_for_status()
+    return response.json()["meta"], iter_results(response)
+
+
+def download_dataset(
+    dataset_id: str,
+    path: pathlib.Path,
+    stale_timestamp: datetime.datetime,
+    format_: str = "shp",
+):
+    download = get_download(dataset_id, format_)
+    if is_download_stale(download, stale_timestamp):
+        format_string = "%Y-%m-%d %H:%M:%S"
+        last_modified = get_download_last_modified(download)
+        print(
+            f"\tExisting download created at {last_modified.strftime(format_string)}, "
+            f"must be newer than {stale_timestamp.strftime(format_string)}; "
+            "triggering new download"
+        )
+        trigger_download(dataset_id, format_, download["attributes"]["spatialRefId"])
+    while is_download_stale(download, stale_timestamp) or not is_download_ready(
+        download
+    ):
+        print(f"\tDownload status is \"{download['attributes']['status']}\"; retrying")
+        time.sleep(15)
+        download = get_download(dataset_id, format_)
+    download_path = path.joinpath(dataset_id)
+    download_path.mkdir(parents=True, exist_ok=True)
+    download_file(download["links"]["content"], download_path)
+
+
+def is_download_ready(payload) -> bool:
+    attributes = payload["attributes"]
+    return attributes["status"] == "ready_unknown"
+
+
+def is_download_stale(payload, stale_timestamp: datetime.datetime) -> bool:
+    last_modified = get_download_last_modified(payload)
+    return last_modified < stale_timestamp
+
+
+def get_download_last_modified(payload):
+    attributes = payload["attributes"]
+    return datetime.datetime.strptime(
+        attributes["lastModified"], "%Y-%m-%dT%H:%M:%S.%f%z"
+    )
+
+
+def download_file(url: str, path: pathlib.Path):
+    with requests.get(url, stream=True) as response:
+        response.raise_for_status()
+        _, options = werkzeug.http.parse_options_header(
+            response.headers["Content-Disposition"]
+        )
+        with path.joinpath(options["filename"]).open("wb") as fp:
+            shutil.copyfileobj(response.raw, fp)
+
+
+def get_download(dataset_id: str, format_: str = "shp"):
+    response = requests.get(
+        f"{BASE_URL}/datasets/{dataset_id}/downloads",
+        params={"formats": format_},
+    )
+    response.raise_for_status()
+    return response.json()["data"][0]
+
+
+def trigger_download(dataset_id: str, format_: str, spatial_ref_id: str):
+    response = requests.post(
+        f"{BASE_URL}/datasets/{dataset_id}/downloads",
+        json={"format": format_, "spatialRefId": spatial_ref_id},
+    )
+    response.raise_for_status()
+
+
+def search_sites(args):
+    response = requests.post(
+        f"{BASE_URL}/search",
+        json={
+            "q": args.query,
+            "filter": {
+                "openData": True,
+                "collection": "any(Site)",
+            },
+        },
+    )
+    response.raise_for_status()
+    datasets = itertools.islice(iter_results(response), args.limit)
+    results = [
+        [
+            dataset["attributes"].get("name"),
+            dataset["attributes"].get("url"),
+            ", ".join(get_site_data(dataset, "groups") or []),
+        ]
+        for dataset in datasets
+    ]
+    print(tabulate.tabulate(results, headers=["Name", "URL", "Group IDs"]))
+    print_additional_records(response.json()["meta"], args.limit)
+
+
+def get_site_data(site, key):
+    response = requests.get(site["links"]["rawEs"])
+    response.raise_for_status()
+    data = response.json()
+    try:
+        return data["_source"]["data"]["catalog"].get(key)
+    except KeyError:
+        return None
+
+
+def search_datasets(args):
+    meta, it = list_datasets(args.group_id, args.tag, args.query)
+    datasets = itertools.islice(it, args.limit)
+    results = [
+        [
+            dataset["attributes"].get("name"),
+            dataset["attributes"].get("url"),
+            ", ".join(dataset["attributes"].get("tags", [])),
+        ]
+        for dataset in datasets
+    ]
+    print(tabulate.tabulate(results, headers=["Name", "URL", "Tags"]))
+    print_additional_records(meta, args.limit)
+
+
+def fetch_datasets(args):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    stale_timestamp = now - datetime.timedelta(hours=args.stale_interval_hours)
+    meta, datasets = list_datasets(args.group_id, args.tag, args.query)
+    if args.limit:
+        datasets = itertools.islice(datasets, args.limit)
+    for dataset in datasets:
+        print(f"Fetching dataset {dataset['attributes']['name']}")
+        download_dataset(dataset["id"], args.path, stale_timestamp)
+    print_additional_records(meta, args.limit)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Search and download resources from ArcGIS Hub")
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.required = True
+
+    search_sites_parser = subparsers.add_parser("search-sites", description="Search ArcGIS Hub sites")
+    search_sites_parser.add_argument("--query", default="*")
+    search_sites_parser.add_argument("--limit", type=int, default=20)
+    search_sites_parser.set_defaults(func=search_sites)
+
+    search_datasets_parser = subparsers.add_parser("search-datasets", description="Search ArcGIS datasets")
+    search_datasets_parser.add_argument("--query", default="*")
+    search_datasets_parser.add_argument("--group-id", nargs="+")
+    search_datasets_parser.add_argument("--tag", nargs="+")
+    search_datasets_parser.add_argument("--limit", type=int, default=20)
+    search_datasets_parser.set_defaults(func=search_datasets)
+
+    fetch_datasets_parser = subparsers.add_parser("fetch-datasets", description="Download ArcGIS datasets")
+    fetch_datasets_parser.add_argument("--query", default="*")
+    fetch_datasets_parser.add_argument("--group-id", nargs="+")
+    fetch_datasets_parser.add_argument("--tag", nargs="+")
+    fetch_datasets_parser.add_argument("--limit", type=int, default=0)
+    fetch_datasets_parser.add_argument(
+        "--path", type=pathlib.Path, default=pathlib.Path(".")
+    )
+    fetch_datasets_parser.add_argument(
+        "--stale-interval-hours", type=int, default=24 * 7
+    )
+    fetch_datasets_parser.set_defaults(func=fetch_datasets)
+
+    args = parser.parse_args()
+    args.func(args)
