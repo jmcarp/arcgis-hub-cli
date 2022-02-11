@@ -68,7 +68,15 @@ def download_dataset(
     format_: str = "shp",
 ):
     download = get_download(dataset_id, format_)
-    if is_download_stale(download, stale_timestamp):
+
+    # Handle datasets that don't exist, like
+    # https://open-data.bouldercolorado.gov/datasets/17d03a45de814e62b8d7b3d603a61448_0/about
+    if download is None:
+        print("\tDownload not found; skipping")
+        return
+
+    # Trigger a new download if the dataset allows and the latest download is stale
+    if can_trigger_download(download) and is_download_stale(download, stale_timestamp):
         format_string = "%Y-%m-%d %H:%M:%S"
         last_modified = get_download_last_modified(download)
         print(
@@ -77,20 +85,45 @@ def download_dataset(
             "triggering new download"
         )
         trigger_download(dataset_id, format_, download["attributes"]["spatialRefId"])
-    while is_download_stale(download, stale_timestamp) or not is_download_ready(
-        download
-    ):
-        print(f"\tDownload status is \"{download['attributes']['status']}\"; retrying")
-        time.sleep(15)
-        download = get_download(dataset_id, format_)
+
+    # Poll until ready or error
+    while True:
+        if did_download_error(download):
+            print(f"\tDownload failed with status \"{download['attributes']['status']}\"; skipping")
+            return
+        if should_poll_download(download, stale_timestamp):
+            print(f"\tDownload status is \"{download['attributes']['status']}\"; retrying")
+            time.sleep(15)
+            download = get_download(dataset_id, format_)
+        else:
+            break
+
     download_path = path.joinpath(dataset_id)
     download_path.mkdir(parents=True, exist_ok=True)
     download_file(download["links"]["content"], download_path)
 
 
+def can_trigger_download(payload) -> bool:
+    """Downloads marked "ready" don't appear to be able to generate new exports."""
+    attributes = payload["attributes"]
+    return attributes["status"] != "ready"
+
+
+def should_poll_download(payload, stale_timestamp: datetime.datetime) -> bool:
+    # Don't poll download if the export is static
+    if not can_trigger_download(payload):
+        return False
+    return is_download_stale(payload, stale_timestamp) or not is_download_ready(payload)
+
+
 def is_download_ready(payload) -> bool:
     attributes = payload["attributes"]
-    return attributes["status"] == "ready_unknown"
+    return attributes["status"] in {"ready", "ready_unknown"}
+
+
+def did_download_error(payload) -> bool:
+    attributes = payload["attributes"]
+    return attributes["status"] in {"error_updating"}
 
 
 def is_download_stale(payload, stale_timestamp: datetime.datetime) -> bool:
@@ -121,7 +154,8 @@ def get_download(dataset_id: str, format_: str = "shp"):
         params={"formats": format_},
     )
     response.raise_for_status()
-    return response.json()["data"][0]
+    data = response.json()
+    return data["data"][0] if data["data"] else None
 
 
 def trigger_download(dataset_id: str, format_: str, spatial_ref_id: str):
