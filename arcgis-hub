@@ -2,6 +2,7 @@
 
 import argparse
 import datetime
+import functools
 import itertools
 import pathlib
 import shutil
@@ -98,9 +99,8 @@ def download_dataset(
         else:
             break
 
-    download_path = path.joinpath(dataset_id)
-    download_path.mkdir(parents=True, exist_ok=True)
-    download_file(download["links"]["content"], download_path)
+    path.mkdir(parents=True, exist_ok=True)
+    download_file(download["links"]["content"], path)
 
 
 def can_trigger_download(payload) -> bool:
@@ -141,6 +141,9 @@ def get_download_last_modified(payload):
 def download_file(url: str, path: pathlib.Path):
     with requests.get(url, stream=True) as response:
         response.raise_for_status()
+        # Decompressed gzipped responses
+        # https://github.com/psf/requests/issues/2155#issuecomment-50771010
+        response.raw.read = functools.partial(response.raw.read, decode_content=True)
         _, options = werkzeug.http.parse_options_header(
             response.headers["Content-Disposition"]
         )
