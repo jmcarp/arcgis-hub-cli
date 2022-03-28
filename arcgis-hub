@@ -36,6 +36,12 @@ def iter_results(response):
         yield from iter_results(response)
 
 
+def get_dataset(dataset_id: str):
+    response = requests.get(f"{BASE_URL}/datasets/{dataset_id}")
+    response.raise_for_status()
+    return response.json()["data"]
+
+
 def list_datasets(
     group_ids: Optional[Sequence[str]] = None,
     tags: Optional[Sequence[str]] = None,
@@ -62,7 +68,7 @@ def list_datasets(
     return response.json()["meta"], iter_results(response)
 
 
-def download_dataset(
+def get_or_trigger_download(
     dataset_id: str,
     path: pathlib.Path,
     stale_timestamp: datetime.datetime,
@@ -87,20 +93,46 @@ def download_dataset(
         )
         trigger_download(dataset_id, format_, download["attributes"]["spatialRefId"])
 
-    # Poll until ready or error
+    return download
+
+
+def poll_downloads(
+    downloads,
+    path: pathlib.Path,
+    stale_timestamp: datetime.datetime,
+    format_: str = "shp",
+):
+    failed = {}
+    path.mkdir(parents=True, exist_ok=True)
     while True:
-        if did_download_error(download):
-            print(f"\tDownload failed with status \"{download['attributes']['status']}\"; skipping")
-            return
-        if should_poll_download(download, stale_timestamp):
-            print(f"\tDownload status is \"{download['attributes']['status']}\"; retrying")
+        next_downloads = {}
+        for dataset_id, data in downloads.items():
+            dataset = data["dataset"]
+            download = data["download"]
+            dataset_name = dataset["attributes"]["name"]
+            status = download["attributes"]["status"]
+            if did_download_error(download):
+                print(
+                    f'\tDownload for {dataset_name} failed with status "{status}"; skipping'
+                )
+                failed[dataset_id] = data
+            elif should_poll_download(download, stale_timestamp):
+                print(f'\tDownload status for {dataset_name} is "{status}"; retrying')
+                next_downloads[dataset_id] = {
+                    "dataset": dataset,
+                    "download": get_download(dataset_id, format_),
+                }
+            else:
+                download_file(
+                    download["links"]["content"], path.joinpath(f"{dataset_name}.zip")
+                )
+        if next_downloads:
+            print("Waiting...")
             time.sleep(15)
-            download = get_download(dataset_id, format_)
+            downloads = next_downloads
         else:
             break
-
-    path.mkdir(parents=True, exist_ok=True)
-    download_file(download["links"]["content"], path)
+    return failed
 
 
 def can_trigger_download(payload) -> bool:
@@ -144,10 +176,7 @@ def download_file(url: str, path: pathlib.Path):
         # Decompressed gzipped responses
         # https://github.com/psf/requests/issues/2155#issuecomment-50771010
         response.raw.read = functools.partial(response.raw.read, decode_content=True)
-        _, options = werkzeug.http.parse_options_header(
-            response.headers["Content-Disposition"]
-        )
-        with path.joinpath(options["filename"]).open("wb") as fp:
+        with path.open("wb") as fp:
             shutil.copyfileobj(response.raw, fp)
 
 
@@ -210,12 +239,13 @@ def search_datasets(args):
     results = [
         [
             dataset["attributes"].get("name"),
-            dataset["attributes"].get("url"),
+            dataset["id"],
             ", ".join(dataset["attributes"].get("tags", [])),
+            dataset["attributes"].get("url"),
         ]
         for dataset in datasets
     ]
-    print(tabulate.tabulate(results, headers=["Name", "URL", "Tags"]))
+    print(tabulate.tabulate(results, headers=["Name", "ID", "Tags", "URL"]))
     print_additional_records(meta, args.limit)
 
 
@@ -225,30 +255,67 @@ def fetch_datasets(args):
     meta, datasets = list_datasets(args.group_id, args.tag, args.query)
     if args.limit:
         datasets = itertools.islice(datasets, args.limit)
+    downloads = {}
     for dataset in datasets:
         print(f"Fetching dataset {dataset['attributes']['name']}")
-        download_dataset(dataset["id"], args.path, stale_timestamp)
+        download = get_or_trigger_download(dataset["id"], args.path, stale_timestamp)
+        if download:
+            downloads[dataset["id"]] = {"download": download, "dataset": dataset}
+    failed = poll_downloads(downloads, args.path, stale_timestamp)
     print_additional_records(meta, args.limit)
+    if failed:
+        failed_label = ", ".join(
+            data["dataset"]["attributes"]["name"] for data in failed.values()
+        )
+        print(f"Failed downloads: {failed_label}")
+        sys.exit(1)
+
+
+def fetch_datasets_by_id(args):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    stale_timestamp = now - datetime.timedelta(hours=args.stale_interval_hours)
+    downloads = {}
+    for dataset_id in args.dataset_id:
+        print(f"Fetching dataset {dataset_id}")
+        dataset = get_dataset(dataset_id)
+        download = get_or_trigger_download(dataset_id, args.path, stale_timestamp)
+        if download:
+            downloads[dataset_id] = {"download": download, "dataset": dataset}
+    failed = poll_downloads(downloads, args.path, stale_timestamp)
+    if failed:
+        failed_label = ", ".join(
+            data["dataset"]["attributes"]["name"] for data in failed.values()
+        )
+        print(f"Failed downloads: {failed_label}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Search and download resources from ArcGIS Hub")
+    parser = argparse.ArgumentParser(
+        description="Search and download resources from ArcGIS Hub"
+    )
     subparsers = parser.add_subparsers(dest="command")
     subparsers.required = True
 
-    search_sites_parser = subparsers.add_parser("search-sites", description="Search ArcGIS Hub sites")
+    search_sites_parser = subparsers.add_parser(
+        "search-sites", description="Search ArcGIS Hub sites"
+    )
     search_sites_parser.add_argument("--query", default="*")
     search_sites_parser.add_argument("--limit", type=int, default=20)
     search_sites_parser.set_defaults(func=search_sites)
 
-    search_datasets_parser = subparsers.add_parser("search-datasets", description="Search ArcGIS datasets")
+    search_datasets_parser = subparsers.add_parser(
+        "search-datasets", description="Search ArcGIS datasets"
+    )
     search_datasets_parser.add_argument("--query", default="*")
     search_datasets_parser.add_argument("--group-id", nargs="+")
     search_datasets_parser.add_argument("--tag", nargs="+")
     search_datasets_parser.add_argument("--limit", type=int, default=20)
     search_datasets_parser.set_defaults(func=search_datasets)
 
-    fetch_datasets_parser = subparsers.add_parser("fetch-datasets", description="Download ArcGIS datasets")
+    fetch_datasets_parser = subparsers.add_parser(
+        "fetch-datasets", description="Download ArcGIS datasets"
+    )
     fetch_datasets_parser.add_argument("--query", default="*")
     fetch_datasets_parser.add_argument("--group-id", nargs="+")
     fetch_datasets_parser.add_argument("--tag", nargs="+")
@@ -260,6 +327,18 @@ if __name__ == "__main__":
         "--stale-interval-hours", type=int, default=24 * 7
     )
     fetch_datasets_parser.set_defaults(func=fetch_datasets)
+
+    fetch_datasets_by_id_parser = subparsers.add_parser(
+        "fetch-datasets-by-id", description="Download ArcGIS datasets by ID"
+    )
+    fetch_datasets_by_id_parser.add_argument("--dataset-id", required=True, nargs="+")
+    fetch_datasets_by_id_parser.add_argument(
+        "--path", type=pathlib.Path, default=pathlib.Path(".")
+    )
+    fetch_datasets_by_id_parser.add_argument(
+        "--stale-interval-hours", type=int, default=24 * 7
+    )
+    fetch_datasets_by_id_parser.set_defaults(func=fetch_datasets_by_id)
 
     args = parser.parse_args()
     args.func(args)
