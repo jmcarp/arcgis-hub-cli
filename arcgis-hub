@@ -104,6 +104,7 @@ def poll_downloads(
 ):
     failed = {}
     path.mkdir(parents=True, exist_ok=True)
+    extension = "zip" if format_ == "shp" else format_
     while True:
         next_downloads = {}
         for dataset_id, data in downloads.items():
@@ -124,7 +125,8 @@ def poll_downloads(
                 }
             else:
                 download_file(
-                    download["links"]["content"], path.joinpath(f"{dataset_name}.zip")
+                    download["links"]["content"],
+                    path.joinpath(f"{dataset_name}.{extension}"),
                 )
         if next_downloads:
             print("Waiting...")
@@ -258,10 +260,12 @@ def fetch_datasets(args):
     downloads = {}
     for dataset in datasets:
         print(f"Fetching dataset {dataset['attributes']['name']}")
-        download = get_or_trigger_download(dataset["id"], args.path, stale_timestamp)
+        download = get_or_trigger_download(
+            dataset["id"], args.path, stale_timestamp, format_=args.format
+        )
         if download:
             downloads[dataset["id"]] = {"download": download, "dataset": dataset}
-    failed = poll_downloads(downloads, args.path, stale_timestamp)
+    failed = poll_downloads(downloads, args.path, stale_timestamp, format_=args.format)
     print_additional_records(meta, args.limit)
     if failed:
         failed_label = ", ".join(
@@ -278,10 +282,12 @@ def fetch_datasets_by_id(args):
     for dataset_id in args.dataset_id:
         print(f"Fetching dataset {dataset_id}")
         dataset = get_dataset(dataset_id)
-        download = get_or_trigger_download(dataset_id, args.path, stale_timestamp)
+        download = get_or_trigger_download(
+            dataset_id, args.path, stale_timestamp, format_=args.format
+        )
         if download:
             downloads[dataset_id] = {"download": download, "dataset": dataset}
-    failed = poll_downloads(downloads, args.path, stale_timestamp)
+    failed = poll_downloads(downloads, args.path, stale_timestamp, format_=args.format)
     if failed:
         failed_label = ", ".join(
             data["dataset"]["attributes"]["name"] for data in failed.values()
@@ -326,6 +332,7 @@ if __name__ == "__main__":
     fetch_datasets_parser.add_argument(
         "--stale-interval-hours", type=int, default=24 * 7
     )
+    fetch_datasets_parser.add_argument("--format", default="shp")
     fetch_datasets_parser.set_defaults(func=fetch_datasets)
 
     fetch_datasets_by_id_parser = subparsers.add_parser(
@@ -338,6 +345,7 @@ if __name__ == "__main__":
     fetch_datasets_by_id_parser.add_argument(
         "--stale-interval-hours", type=int, default=24 * 7
     )
+    fetch_datasets_by_id_parser.add_argument("--format", default="shp")
     fetch_datasets_by_id_parser.set_defaults(func=fetch_datasets_by_id)
 
     args = parser.parse_args()
